@@ -3,6 +3,10 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{ready, Context, Poll},
 };
 
@@ -15,18 +19,23 @@ use futures_channel::{
 use futures_util::{
     future::{Either, FusedFuture},
     stream::{FusedStream, Stream},
+    task::AtomicWaker,
 };
-use http::{Method, Request, Response, StatusCode};
+use http::{header::HOST, uri::Authority, HeaderName, Method, Request, Response, StatusCode, Uri};
 use http2::{
-    client::{Builder, Connection, ResponseFuture, SendRequest},
-    SendStream,
+    client::{
+        Builder, Connection, Control, PushPromises, PushedResponseFuture, ResponseFuture,
+        SendRequest,
+    },
+    ext::HeaderOrder,
+    RecvStream, SendStream,
 };
 use http_body::Body;
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{
-    ping,
+    ordered_fields, ping,
     ping::{Ponger, Recorder},
     H2Upgraded, PipeToSendStream, SendBuf,
 };
@@ -34,9 +43,12 @@ use crate::{
     body::{self, Incoming},
     dispatch::{self, Callback, SendWhen, TrySendError},
     error::BoxError,
-    ext::OnPreserveHeader,
+    ext::{
+        ExpectContinue, HostAsAuthority, NoImpliedContentLength, OnInformational, OnPreserveHeader,
+        PushedResponse, RawHeaders, RawTrailers, ServerPush,
+    },
     proto::{headers, Dispatched},
-    rt::{bounds::Http2ClientConnExec, Time},
+    rt::{bounds::Http2ClientConnExec, Sleep, Time},
     upgrade::{self, Upgraded},
     Error, Result,
 };
@@ -52,6 +64,60 @@ type ConnDropRef = mpsc::Sender<Infallible>;
 ///// the "dispatch" task will be notified and can shutdown sooner.
 type ConnEof = oneshot::Receiver<Infallible>;
 
+/// The request bodies a connection still has to send, or the data of which it still
+/// holds queued (see `conn::http2::Builder::sending_bodies`).
+#[derive(Debug, Default)]
+pub struct SendingBodies {
+    count: AtomicUsize,
+    none: AtomicWaker,
+}
+
+impl SendingBodies {
+    /// Whether the connection still has some to send, `cx` woken once it has none.
+    pub fn poll_any(&self, cx: &mut Context<'_>) -> bool {
+        self.none.register(cx.waker());
+        self.count.load(Ordering::Acquire) > 0
+    }
+}
+
+/// What a connection's caller shares with it (see `conn::http2::Builder::sending_bodies`):
+/// its request bodies still to send, and whether a request canceled now sends the rest of
+/// its body rather than resetting its stream.
+#[derive(Clone)]
+pub(crate) struct BodiesSent {
+    pub(crate) sending: Arc<SendingBodies>,
+    pub(crate) finishes: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+/// A request body still to send, counted in its connection's [`SendingBodies`] until dropped.
+struct Sending(Arc<SendingBodies>);
+
+impl Sending {
+    fn new(sending: &Arc<SendingBodies>) -> Self {
+        sending.count.fetch_add(1, Ordering::AcqRel);
+        Sending(Arc::clone(sending))
+    }
+}
+
+impl Drop for Sending {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.none.wake();
+        }
+    }
+}
+
+impl<B, E, T> ClientTask<B, E, T>
+where
+    B: Body,
+    E: Unpin,
+{
+    /// Sends frames of the caller's choosing on the connection while it lives.
+    pub(crate) fn control(&self) -> Control {
+        self.h2_tx.control()
+    }
+}
+
 pub(crate) async fn handshake<T, B, E>(
     io: T,
     req_rx: ClientRx<B>,
@@ -59,6 +125,7 @@ pub(crate) async fn handshake<T, B, E>(
     ping_config: ping::Config,
     mut exec: E,
     timer: Time,
+    bodies_sent: Option<BodiesSent>,
 ) -> Result<ClientTask<B, E, T>>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -105,6 +172,8 @@ where
         h2_tx,
         req_rx,
         fut_ctx: None,
+        awaiting_settings: None,
+        bodies_sent,
         marker: PhantomData,
     })
 }
@@ -281,6 +350,9 @@ pin_project! {
             #[pin]
             task: ConnTask<T, B>,
         },
+        Push {
+            forward: Pin<Box<dyn Future<Output = ()> + Send>>,
+        },
     }
 }
 
@@ -300,6 +372,7 @@ where
             H2ClientFutureProject::Pipe { pipe } => pipe.poll(cx),
             H2ClientFutureProject::Send { send_when } => send_when.poll(cx),
             H2ClientFutureProject::Task { task } => task.poll(cx),
+            H2ClientFutureProject::Push { forward } => forward.as_mut().poll(cx),
         }
     }
 }
@@ -314,9 +387,23 @@ where
     body_tx: SendStream<SendBuf<B::Data>>,
     body: B,
     cb: Callback<Request<B>, Response<Incoming>>,
+    on_informational: Option<OnInformational>,
+    raw_trailers: Option<RawTrailers>,
+    expect_continue: Option<ExpectContinue>,
+    pushes: Option<(Pushes, oneshot::Sender<Pushes>)>,
+    // Counts the request as still to send from before its HEADERS were queued (see
+    // `SendingBodies`).
+    sending: Option<Sending>,
 }
 
 impl<B: Body> Unpin for FutCtx<B> {}
+
+/// Holds a request body back until the server answers `100 Continue` (`true`), a final
+/// response arrives first (`false`, or the sender dropped), or `timeout` passes.
+struct ContinueWait {
+    rx: oneshot::Receiver<bool>,
+    timeout: Pin<Box<dyn Sleep>>,
+}
 
 pub(crate) struct ClientTask<B, E, T>
 where
@@ -330,6 +417,9 @@ where
     h2_tx: SendRequest<SendBuf<B::Data>>,
     req_rx: ClientRx<B>,
     fut_ctx: Option<FutCtx<B>>,
+    /// An extended CONNECT waiting for the peer's SETTINGS (see `poll`).
+    awaiting_settings: Option<(Request<B>, Callback<Request<B>, Response<Incoming>>)>,
+    bodies_sent: Option<BodiesSent>,
     marker: PhantomData<T>,
 }
 
@@ -345,6 +435,12 @@ pin_project! {
         #[pin]
         ping: Option<Recorder>,
         cancel_rx: Option<oneshot::Receiver<()>>,
+        continue_wait: Option<ContinueWait>,
+        // Counts its body as still to send until it is done, then hands that to its stream
+        // (see `SendingBodies`).
+        sending: Option<Sending>,
+        // Whether its body still goes once canceled (see `BodiesSent`).
+        finishes: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     }
 }
 
@@ -364,6 +460,14 @@ where
         // response future due to a timeout). If so, reset the h2 stream
         // so that a RST_STREAM is sent and flow-control capacity is freed.
         match this.cancel_rx.as_mut().map(|rx| Pin::new(rx).poll(cx)) {
+            // Once its client's connection ended, its body still sends what that client sent,
+            // its stream then ending with its connection, as that client's did.
+            Some(Poll::Ready(Ok(())))
+                if this.finishes.as_ref().is_some_and(|finishes| finishes()) =>
+            {
+                debug!("client request body send cancelled, finishing the body");
+                *this.cancel_rx = None;
+            }
             Some(Poll::Ready(Ok(()))) => {
                 debug!("client request body send cancelled, resetting stream");
                 this.pipe.as_mut().send_reset(http2::Reason::CANCEL);
@@ -379,10 +483,30 @@ where
             Some(Poll::Pending) | None => {}
         }
 
+        if let Some(wait) = this.continue_wait.as_mut() {
+            match Pin::new(&mut wait.rx).poll(cx) {
+                Poll::Ready(Ok(true)) => *this.continue_wait = None,
+                Poll::Ready(Ok(false) | Err(_)) => {
+                    debug!("final response before 100 Continue; not sending the request body");
+                    this.conn_drop_ref.take().expect(EXPECT_TAKEN_ONCE_MSG);
+                    this.ping.take().expect(EXPECT_TAKEN_ONCE_MSG);
+                    return Poll::Ready(());
+                }
+                Poll::Pending => {
+                    ready!(wait.timeout.as_mut().poll(cx));
+                    debug!("no 100 Continue before the timeout; sending the request body");
+                    *this.continue_wait = None;
+                }
+            }
+        }
+
         match Pin::new(&mut this.pipe).poll(cx) {
             Poll::Ready(result) => {
                 if let Err(_e) = result {
                     debug!("client request body error: {}", _e);
+                }
+                if let Some(sending) = this.sending.take() {
+                    this.pipe.as_mut().on_sent(move || drop(sending));
                 }
                 drop(this.conn_drop_ref.take().expect(EXPECT_TAKEN_ONCE_MSG));
                 drop(this.ping.take().expect(EXPECT_TAKEN_ONCE_MSG));
@@ -409,14 +533,40 @@ where
         // reset the stream when the client cancels the request.
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
 
+        // With `Expect: 100-continue`, the response tells the held-back body whether to go.
+        let (continue_wait, continue_tx) = match f.expect_continue.and_then(|expect| expect.wait) {
+            Some((timer, timeout)) => {
+                let (tx, rx) = oneshot::channel();
+                let timeout = timer.sleep(timeout);
+                (Some(ContinueWait { rx, timeout }), Some(tx))
+            }
+            None => (None, None),
+        };
+
         let send_stream = if !f.is_connect {
-            if !f.eos {
-                let mut pipe = PipeToSendStream::new(f.body, f.body_tx);
+            if f.eos {
+                // Its HEADERS still to send until they went.
+                if let Some(sending) = f.sending {
+                    let mut body_tx = f.body_tx;
+                    body_tx.on_sent(move || drop(sending));
+                }
+            } else {
+                let mut pipe = PipeToSendStream::new(f.body, f.body_tx, f.raw_trailers);
 
                 // eagerly see if the body pipe is ready and
                 // can thus skip allocating in the executor
-                match Pin::new(&mut pipe).poll(cx) {
-                    Poll::Ready(_) => (),
+                let eager = if continue_wait.is_none() {
+                    Pin::new(&mut pipe).poll(cx)
+                } else {
+                    Poll::Pending
+                };
+                match eager {
+                    // Still to send until what it queued went (see `SendingBodies`).
+                    Poll::Ready(_) => {
+                        if let Some(sending) = f.sending {
+                            Pin::new(&mut pipe).on_sent(move || drop(sending));
+                        }
+                    }
                     Poll::Pending => {
                         let conn_drop_ref = self.conn_drop_ref.clone();
                         // keep the ping recorder's knowledge of an
@@ -429,6 +579,12 @@ where
                             conn_drop_ref: Some(conn_drop_ref),
                             ping: Some(ping),
                             cancel_rx: Some(cancel_rx),
+                            continue_wait,
+                            sending: f.sending,
+                            finishes: self
+                                .bodies_sent
+                                .as_ref()
+                                .map(|sent| Arc::clone(&sent.finishes)),
                         };
                         // Clear send task
                         self.executor
@@ -439,7 +595,12 @@ where
 
             None
         } else {
-            Some(f.body_tx)
+            // Its HEADERS still to send until they went, its tunnel then free to go on.
+            let mut body_tx = f.body_tx;
+            if let Some(sending) = f.sending {
+                body_tx.on_sent(move || drop(sending));
+            }
+            Some(body_tx)
         };
 
         self.executor.execute_h2_future(H2ClientFuture::Send {
@@ -449,6 +610,9 @@ where
                     ping: Some(ping),
                     send_stream: Some(send_stream),
                     cancel_tx: Some(cancel_tx),
+                    on_informational: f.on_informational,
+                    continue_tx,
+                    pushes: f.pushes,
                 },
                 call_back: Some(f.cb),
             },
@@ -485,6 +649,11 @@ pin_project! {
         #[pin]
         send_stream: Option<Option<SendStream<SendBuf<<B as Body>::Data>>>>,
         cancel_tx: Option<oneshot::Sender<()>>,
+        on_informational: Option<OnInformational>,
+        continue_tx: Option<oneshot::Sender<bool>>,
+        // The pushes promised on the request, forwarded here until the response's head
+        // arrives, then handed to their own task.
+        pushes: Option<(Pushes, oneshot::Sender<Pushes>)>,
     }
 }
 
@@ -507,15 +676,46 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
+        // Interim (1xx) responses reach the request's callback, in order, before the
+        // final response is taken; a 100 releases a body held back for it.
+        if this.on_informational.is_some() || this.continue_tx.is_some() {
+            while let Poll::Ready(Some(Ok(mut res))) =
+                this.fut.as_mut().get_mut().poll_informational(cx)
+            {
+                if res.status() == StatusCode::CONTINUE {
+                    if let Some(tx) = this.continue_tx.take() {
+                        let _ = tx.send(true);
+                    }
+                }
+                if let Some(callback) = this.on_informational.as_ref() {
+                    record_raw_headers(&mut res);
+                    callback.call(res);
+                }
+            }
+        }
+
+        // Pushes promised ahead of the head go ahead of the response.
+        if let Some((pushes, _)) = this.pushes.as_mut() {
+            pushes.forward(cx);
+        }
         let result = ready!(this.fut.poll(cx));
+        if let Some(tx) = this.continue_tx.take() {
+            let _ = tx.send(false);
+        }
+        if let Some((mut pushes, handoff)) = this.pushes.take() {
+            if result.is_ok() && pushes.forward(cx) {
+                let _ = handoff.send(pushes);
+            }
+        }
 
         let ping = this.ping.take().expect("Future polled twice");
         let send_stream = this.send_stream.take().expect("Future polled twice");
 
         match result {
-            Ok(res) => {
+            Ok(mut res) => {
                 // record that we got the response headers
                 ping.record_non_data();
+                record_raw_headers(&mut res);
 
                 let content_length = headers::content_length_parse_all(res.headers());
                 if let (Some(mut send_stream), StatusCode::OK) = (send_stream, res.status()) {
@@ -545,11 +745,7 @@ where
 
                     Poll::Ready(Ok(res))
                 } else {
-                    let res = res.map(|stream| {
-                        let ping = ping.for_stream(&stream);
-                        Incoming::h2(stream, content_length.into(), ping)
-                    });
-                    Poll::Ready(Ok(res))
+                    Poll::Ready(Ok(incoming(res, content_length, ping)))
                 }
             }
             Err(err) => {
@@ -558,6 +754,111 @@ where
                 debug!("client response error: {}", err);
                 Poll::Ready(Err((Error::new_h2(err), None::<Request<B>>)))
             }
+        }
+    }
+}
+
+/// `res`, a response head arrived with its stream, with the stream as its body.
+fn incoming(
+    res: Response<RecvStream>,
+    content_length: Option<u64>,
+    ping: Recorder,
+) -> Response<Incoming> {
+    // Trailers may follow the body; record their field order.
+    let raw_trailers = RawTrailers::default();
+    let mut res = res.map(|stream| {
+        let ping = ping.for_stream(&stream);
+        Incoming::h2(stream, content_length.into(), ping, raw_trailers.clone())
+    });
+    res.extensions_mut().insert(raw_trailers);
+    res
+}
+
+/// The pushes promised on a request's stream, each sent to a [`ServerPush`]'s receiver as
+/// its promise arrives.
+struct Pushes {
+    promises: PushPromises,
+    tx: tokio::sync::mpsc::UnboundedSender<Box<(Request<()>, PushedResponse)>>,
+    ping: Recorder,
+}
+
+impl Pushes {
+    /// Forwards the pushes promised so far, telling whether more can come.
+    fn forward(&mut self, cx: &mut Context<'_>) -> bool {
+        loop {
+            match self.promises.poll_push_promise(cx) {
+                Poll::Ready(Some(Ok(promise))) => {
+                    let (request, response) = promise.into_parts();
+                    let response = pushed_response(response, self.ping.clone());
+                    let _ = self.tx.send(Box::new((request, response)));
+                }
+                Poll::Ready(_) => return false,
+                Poll::Pending => return true,
+            }
+        }
+    }
+}
+
+/// Forwards the pushes `handoff` hands over until no more can come, or their receiver is
+/// dropped.
+async fn forward_pushes(handoff: oneshot::Receiver<Pushes>) {
+    let Ok(mut pushes) = handoff.await else {
+        return;
+    };
+    let tx = pushes.tx.clone();
+    let mut closed = std::pin::pin!(tx.closed());
+    std::future::poll_fn(|cx| {
+        if closed.as_mut().poll(cx).is_ready() || !pushes.forward(cx) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
+/// A pushed response, read as a request's response is.
+fn pushed_response(response: PushedResponseFuture, ping: Recorder) -> PushedResponse {
+    PushedResponse(Box::pin(async move {
+        let mut res = response.await.map_err(Error::new_h2)?;
+        ping.record_non_data();
+        record_raw_headers(&mut res);
+        let content_length = headers::content_length_parse_all(res.headers());
+        Ok(incoming(res, content_length, ping))
+    }))
+}
+
+/// Records a response head's field order as [`RawHeaders`], as the HTTP/1 parser does,
+/// so repeats interleaved with other fields keep their place.
+fn record_raw_headers<T>(res: &mut Response<T>) {
+    let Some(HeaderOrder(order)) = res.extensions_mut().remove::<HeaderOrder>() else {
+        return;
+    };
+    let raw = ordered_fields(res.headers(), order);
+    res.extensions_mut().insert(RawHeaders(raw));
+}
+
+/// Puts a request's `Host` field into the authority of its URI, which HTTP/2 sends as
+/// `:authority` (RFC 9113 section 8.3.1), as its [`HostAsAuthority`] asks, so a `Host` a
+/// caller sets (relaying an HTTP/1 request, or editing one) names the authority. A value
+/// that isn't an authority stays a field.
+fn host_as_authority<T>(req: &mut Request<T>) {
+    let Some(HostAsAuthority { keep_field }) = req.extensions_mut().remove() else {
+        return;
+    };
+    let Some(authority) = req
+        .headers()
+        .get(HOST)
+        .and_then(|host| Authority::try_from(host.as_bytes()).ok())
+    else {
+        return;
+    };
+    let mut parts = req.uri().clone().into_parts();
+    parts.authority = Some(authority);
+    if let Ok(uri) = Uri::from_parts(parts) {
+        *req.uri_mut() = uri;
+        if !keep_field {
+            req.headers_mut().remove(HOST);
         }
     }
 }
@@ -594,17 +895,47 @@ where
                 continue;
             }
 
-            match self.req_rx.poll_recv(cx) {
-                Poll::Ready(Some((req, cb))) => {
+            let next = match self.awaiting_settings.take() {
+                Some(next) => Poll::Ready(Some(next)),
+                None => self.req_rx.poll_recv(cx),
+            };
+            match next {
+                Poll::Ready(Some((req, mut cb))) => {
                     // Check that future hasn't been canceled already
                     if cb.is_canceled() {
                         trace!("request callback is canceled");
                         continue;
                     }
+                    // An extended CONNECT waits for the peer's SETTINGS, which tell whether it
+                    // may go at all (RFC 8441 §3), as do the requests after it, unless its
+                    // caller gives up on it.
+                    let extensions = req.extensions();
+                    if (extensions.get::<::http2::ext::ExtendedConnect>().is_some()
+                        || extensions.get::<::http2::ext::Protocol>().is_some())
+                        && self.h2_tx.poll_extended_connect(cx).is_pending()
+                    {
+                        if cb.poll_canceled(cx).is_ready() {
+                            trace!("request callback is canceled");
+                            continue;
+                        }
+                        self.awaiting_settings = Some((req, cb));
+                        return Poll::Pending;
+                    }
                     let (head, body) = req.into_parts();
                     let mut req = ::http::Request::from_parts(head, ());
+                    let on_informational = req.extensions_mut().remove::<OnInformational>();
+                    let server_push = req.extensions_mut().remove::<ServerPush>();
+                    let expect_continue = req
+                        .extensions_mut()
+                        .remove::<ExpectContinue>()
+                        .filter(|_| ExpectContinue::is_expected(req.headers()));
                     super::strip_connection_headers(req.headers_mut(), true);
-                    if let Some(len) = body.size_hint().exact() {
+                    host_as_authority(&mut req);
+                    let imply_length = req
+                        .extensions_mut()
+                        .remove::<NoImpliedContentLength>()
+                        .is_none();
+                    if let Some(len) = body.size_hint().exact().filter(|_| imply_length) {
                         if len != 0 || headers::method_has_defined_payload_semantics(req.method()) {
                             headers::set_content_length_if_missing(req.headers_mut(), len);
                         }
@@ -613,6 +944,13 @@ where
                     // Sort headers
                     if let Some(header_sort) = req.extensions_mut().remove::<OnPreserveHeader>() {
                         header_sort.call(req.headers_mut());
+                        // `call` groups a repeated name's values: send the fields in the
+                        // order the callback writes them, repeats interleaved in place.
+                        let mut order = Vec::with_capacity(req.headers().len());
+                        header_sort.call_visit(&mut req.headers().clone(), &mut |name, _| {
+                            order.extend(HeaderName::from_bytes(name.as_ref()).ok());
+                        });
+                        req.extensions_mut().insert(HeaderOrder(order));
                     }
 
                     let is_connect = req.method() == Method::CONNECT;
@@ -630,7 +968,14 @@ where
                         continue;
                     }
 
-                    let (fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos) {
+                    // `send_request` clears the extensions.
+                    let raw_trailers = req.extensions().get::<RawTrailers>().cloned();
+                    let sending = self
+                        .bodies_sent
+                        .as_ref()
+                        .map(|sent| Sending::new(&sent.sending));
+                    let (mut fut, body_tx) = match self.h2_tx.send_request(req, !is_connect && eos)
+                    {
                         Ok(ok) => ok,
                         Err(err) => {
                             debug!("client send request error: {}", err);
@@ -642,6 +987,19 @@ where
                         }
                     };
 
+                    let pushes = server_push.map(|ServerPush(tx)| {
+                        let (handoff, handed) = oneshot::channel();
+                        self.executor.execute_h2_future(H2ClientFuture::Push {
+                            forward: Box::pin(forward_pushes(handed)),
+                        });
+                        let pushes = Pushes {
+                            promises: fut.push_promises(),
+                            tx,
+                            ping: self.ping.clone(),
+                        };
+                        (pushes, handoff)
+                    });
+
                     let f = FutCtx {
                         is_connect,
                         eos,
@@ -649,6 +1007,11 @@ where
                         body_tx,
                         body,
                         cb,
+                        on_informational,
+                        raw_trailers,
+                        expect_continue: expect_continue.filter(|_| !is_connect && !eos),
+                        pushes,
+                        sending,
                     };
 
                     // Check poll_ready() again.

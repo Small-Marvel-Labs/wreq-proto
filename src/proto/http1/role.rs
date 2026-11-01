@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt::{self, Write as _},
     mem::MaybeUninit,
 };
@@ -14,7 +15,7 @@ use super::{Encode, Encoder, Http1Transaction, ParseContext, ParsedMessage};
 use crate::{
     body::DecodedLength,
     error::Parse,
-    ext::{OnPreserveHeader, ReasonPhrase},
+    ext::{FieldSpacing, OnPreserveHeader, RawHeaders, RawRequestTarget, ReasonPhrase},
     proto::{headers, BodyLength, MessageHead, RequestHead, RequestLine},
     Error, Result,
 };
@@ -147,10 +148,14 @@ impl Http1Transaction for Client {
                         let status = StatusCode::from_u16(res.code.unwrap())?;
 
                         let reason = {
-                            let reason = res.reason.unwrap();
+                            let reason = match res.reason.unwrap() {
+                                // httparse reports a reason phrase with obs-text as empty.
+                                "" => raw_reason(bytes, &ctx.h1_parser_config),
+                                reason => reason.as_bytes(),
+                            };
                             // Only save the reason phrase if it isn't the canonical reason
-                            if Some(reason) != status.canonical_reason() {
-                                Some(Bytes::copy_from_slice(reason.as_bytes()))
+                            if Some(reason) != status.canonical_reason().map(str::as_bytes) {
+                                Some(Bytes::copy_from_slice(reason))
                             } else {
                                 None
                             }
@@ -194,6 +199,7 @@ impl Http1Transaction for Client {
             let mut headers = ctx.cached_headers.take().unwrap_or_default();
 
             let mut keep_alive = version == Version::HTTP_11;
+            let mut raw_headers = Vec::with_capacity(headers_len);
 
             headers.reserve(headers_len);
             for header in &headers_indices[..headers_len] {
@@ -214,10 +220,12 @@ impl Http1Transaction for Client {
                     }
                 }
 
+                raw_headers.push((slice.slice(header.name.0..header.name.1), value.clone()));
                 headers.append(name, value);
             }
 
             let mut extensions = http::Extensions::default();
+            extensions.insert(RawHeaders(raw_headers));
 
             if let Some(reason) = reason {
                 // Safety: httparse ensures that only valid reason phrase bytes are present in this
@@ -246,6 +254,10 @@ impl Http1Transaction for Client {
             }
 
             if head.subject.is_informational() {
+                if head.subject == StatusCode::CONTINUE {
+                    // The server wants the body a request with `Expect: 100-continue` holds back.
+                    *ctx.expect_continue = None;
+                }
                 if let Some(callback) = ctx.on_informational {
                     callback.call(head.into_response(()));
                 }
@@ -275,8 +287,28 @@ impl Http1Transaction for Client {
 
         extend(dst, msg.head.subject.0.as_str().as_bytes());
         extend(dst, b" ");
-        //TODO: add API to http::Uri to encode without std::fmt
-        let _ = write!(FastWrite(dst), "{} ", msg.head.subject.1);
+        let uri = &msg.head.subject.1;
+        match msg
+            .head
+            .extensions
+            .get::<RawRequestTarget>()
+            .filter(|raw| uri.path_and_query() == Some(&raw.encoded))
+        {
+            Some(raw) => {
+                if let Some(scheme) = uri.scheme() {
+                    let _ = write!(FastWrite(dst), "{scheme}://");
+                }
+                if let Some(authority) = uri.authority() {
+                    extend(dst, authority.as_str().as_bytes());
+                }
+                extend(dst, &raw.raw);
+                extend(dst, b" ");
+            }
+            //TODO: add API to http::Uri to encode without std::fmt
+            None => {
+                let _ = write!(FastWrite(dst), "{uri} ");
+            }
+        }
 
         match msg.head.version {
             Version::HTTP_10 => extend(dst, b"HTTP/1.0"),
@@ -290,16 +322,31 @@ impl Http1Transaction for Client {
         extend(dst, b"\r\n");
 
         if let Some(header_sort) = &msg.head.extensions.get::<OnPreserveHeader>() {
+            let spacing = msg.head.extensions.get::<FieldSpacing>();
+            let mut lines = HeaderMap::<usize>::default();
             header_sort.call_visit(&mut msg.head.headers, &mut |name, value| {
                 extend(dst, name.as_ref());
 
-                // Wanted for curl test cases that send `X-Custom-Header:\r\n`
-                if value.is_empty() {
-                    extend(dst, b":\r\n");
-                } else {
-                    extend(dst, b": ");
-                    extend(dst, value.as_bytes());
-                    extend(dst, b"\r\n");
+                let spacing = spacing.and_then(|spacing| {
+                    let name = HeaderName::from_bytes(name.as_ref()).ok()?;
+                    let nth = lines.entry(&name).or_insert(0);
+                    *nth += 1;
+                    spacing.get(&name, *nth - 1)
+                });
+                match spacing {
+                    Some((separator, trailing)) => {
+                        extend(dst, separator);
+                        extend(dst, value.as_bytes());
+                        extend(dst, trailing);
+                        extend(dst, b"\r\n");
+                    }
+                    // Wanted for curl test cases that send `X-Custom-Header:\r\n`
+                    None if value.is_empty() => extend(dst, b":\r\n"),
+                    None => {
+                        extend(dst, b": ");
+                        extend(dst, value.as_bytes());
+                        extend(dst, b"\r\n");
+                    }
                 }
             });
         } else {
@@ -480,26 +527,6 @@ impl Client {
             }
         };
 
-        let encoder = encoder.map(|enc| {
-            if enc.is_chunked() {
-                // Parse Trailer header values into HeaderNames.
-                // Each Trailer header value may contain comma-separated names.
-                // HeaderName normalizes to lowercase, enabling case-insensitive matching.
-                let allowed_trailer_fields: Vec<HeaderName> = headers
-                    .get_all(header::TRAILER)
-                    .iter()
-                    .filter_map(|hv| hv.to_str().ok())
-                    .flat_map(|s| s.split(','))
-                    .filter_map(|s| HeaderName::from_bytes(s.trim().as_bytes()).ok())
-                    .collect();
-
-                if !allowed_trailer_fields.is_empty() {
-                    return enc.into_chunked_with_trailing_fields(allowed_trailer_fields);
-                }
-            }
-
-            enc
-        });
 
         // This is because we need a second mutable borrow to remove
         // content-length header.
@@ -582,6 +609,35 @@ impl Client {
     }
 }
 
+/// The reason phrase of the status line httparse parsed from `bytes`, as its bytes: what
+/// follows `HTTP/1.x`, the status code and their delimiters, to the end of the line.
+fn raw_reason<'a>(bytes: &'a [u8], config: &httparse::ParserConfig) -> &'a [u8] {
+    fn delimited(rest: &[u8], multiple_spaces: bool) -> &[u8] {
+        let spaces = if multiple_spaces {
+            rest.iter().take_while(|&&b| b == b' ').count()
+        } else {
+            1
+        };
+        rest.get(spaces..).unwrap_or(&[])
+    }
+    let multiple_spaces = config.multiple_spaces_in_response_status_delimiters_are_allowed();
+    // Past the empty lines httparse skips.
+    let start = bytes
+        .iter()
+        .position(|&b| b != b'\r' && b != b'\n')
+        .unwrap_or(bytes.len());
+    let line = &bytes[start..];
+    let line = &line[..line
+        .iter()
+        .position(|&b| b == b'\r' || b == b'\n')
+        .unwrap_or(line.len())];
+    let code = delimited(line.get(8..).unwrap_or(&[]), multiple_spaces);
+    match code.get(3..) {
+        Some(rest) if rest.first() == Some(&b' ') => delimited(rest, multiple_spaces),
+        _ => &[],
+    }
+}
+
 fn set_content_length(headers: &mut HeaderMap, len: u64) -> Encoder {
     // At this point, there should not be a valid Content-Length
     // header. However, since we'll be indexing in anyways, we can
@@ -653,6 +709,51 @@ pub(crate) fn write_headers(headers: &HeaderMap, dst: &mut Vec<u8>) {
         extend(dst, b": ");
         extend(dst, value.as_bytes());
         extend(dst, b"\r\n");
+    }
+}
+
+/// Writes `headers` in the order and spelling of the `raw` fields, each spelling taking
+/// the next value of its name, then the values `raw` doesn't cover, lowercase.
+pub(crate) fn write_raw_headers(
+    headers: &HeaderMap,
+    raw: &[(Bytes, HeaderValue)],
+    spacing: Option<&Vec<(Bytes, Bytes)>>,
+    dst: &mut Vec<u8>,
+) {
+    let mut line = |name: &[u8], value: &HeaderValue, spacing: Option<&(Bytes, Bytes)>| {
+        extend(dst, name);
+        match spacing {
+            Some((separator, trailing)) => {
+                extend(dst, separator);
+                extend(dst, value.as_bytes());
+                extend(dst, trailing);
+            }
+            None => {
+                extend(dst, b": ");
+                extend(dst, value.as_bytes());
+            }
+        }
+        extend(dst, b"\r\n");
+    };
+    let mut values = HashMap::new();
+    for (at, (spelling, _)) in raw.iter().enumerate() {
+        let Ok(name) = HeaderName::from_bytes(spelling) else {
+            continue;
+        };
+        let values = values
+            .entry(name)
+            .or_insert_with_key(|name| headers.get_all(name).iter());
+        if let Some(value) = values.next() {
+            line(spelling, value, spacing.map(|spacing| &spacing[at]));
+        }
+    }
+    for name in headers.keys() {
+        let rest = values
+            .remove(name)
+            .unwrap_or_else(|| headers.get_all(name).iter());
+        for value in rest {
+            line(name.as_ref(), value, None);
+        }
     }
 }
 

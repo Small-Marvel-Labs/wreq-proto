@@ -10,16 +10,21 @@ use http_body::Frame;
 
 use self::Kind::{Chunked, Eof, Length};
 use super::{io::MemRead, role::DEFAULT_MAX_HEADERS, DecodedLength};
+use crate::ext::{RawChunks, RawTrailers, TrailerSpacing};
 
-/// Maximum amount of bytes allowed in chunked extensions.
+/// Maximum amount of bytes allowed in a chunk's extensions.
 ///
-/// This limit is currentlty applied for the entire body, not per chunk.
+/// This limit is applied per chunk-size line, not for the entire body.
 const CHUNKED_EXTENSIONS_LIMIT: u64 = 1024 * 16;
 
 /// Maximum number of bytes allowed for all trailer fields.
 ///
 /// TODO: remove this when we land h1_max_header_size support
 const TRAILER_LIMIT: usize = 1024 * 16;
+
+/// How much data of chunks already read goes out together, as one frame, so a body sent
+/// in many small chunks isn't relayed a frame (and a write) per chunk.
+const CHUNKS_COALESCED: usize = 1024 * 16;
 
 /// Decoders to handle different Transfer-Encodings.
 ///
@@ -43,6 +48,12 @@ enum Kind {
         trailers_cnt: usize,
         h1_max_headers: Option<usize>,
         h1_max_header_size: Option<usize>,
+        raw_trailers: Option<(RawTrailers, TrailerSpacing)>,
+        raw_chunks: Option<RawChunks>,
+        /// The chunk-size line being read, for `raw_chunks`.
+        raw_line: BytesMut,
+        /// An error met after data returned first, for the next decode to return.
+        deferred: Option<DeferredError>,
     },
     /// A Reader used for responses that don't indicate a length or chunked.
     ///
@@ -78,6 +89,26 @@ enum ChunkedState {
     EndCr,
     EndLf,
     End,
+}
+
+/// Reads through `rdr`, appending what it reads to `line`.
+struct LineRecorder<'a, R> {
+    rdr: &'a mut R,
+    line: &'a mut BytesMut,
+}
+
+impl<R: MemRead> MemRead for LineRecorder<'_, R> {
+    fn read_mem(&mut self, cx: &mut Context<'_>, len: usize) -> Poll<io::Result<Bytes>> {
+        let buf = ready!(self.rdr.read_mem(cx, len))?;
+        if self.line.len() + buf.len() > CHUNKED_EXTENSIONS_LIMIT as usize {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk size line over limit",
+            )));
+        }
+        self.line.extend_from_slice(&buf);
+        Poll::Ready(Ok(buf))
+    }
 }
 
 struct StepArgs<'a> {
@@ -118,6 +149,10 @@ impl Decoder {
                 trailers_cnt: 0,
                 h1_max_headers,
                 h1_max_header_size,
+                raw_trailers: None,
+                raw_chunks: None,
+                raw_line: BytesMut::new(),
+                deferred: None,
             },
         }
     }
@@ -132,6 +167,23 @@ impl Decoder {
             DecodedLength::CLOSE_DELIMITED => Decoder::eof(),
             length => Decoder::length(length.danger_len()),
         }
+    }
+
+    /// Records a chunked body's trailer fields as sent, and their spacing, into `raw` when
+    /// it reads them.
+    pub(super) fn with_raw_trailers(mut self, raw: Option<(RawTrailers, TrailerSpacing)>) -> Self {
+        if let Chunked { raw_trailers, .. } = &mut self.kind {
+            *raw_trailers = raw;
+        }
+        self
+    }
+
+    /// Records a chunked body's chunk-size lines as sent into `raw` as it reads them.
+    pub(super) fn with_raw_chunks(mut self, raw: Option<RawChunks>) -> Self {
+        if let Chunked { raw_chunks, .. } = &mut self.kind {
+            *raw_chunks = raw;
+        }
+        self
     }
 
     #[inline]
@@ -182,25 +234,63 @@ impl Decoder {
                 ref mut trailers_cnt,
                 ref h1_max_headers,
                 ref h1_max_header_size,
+                ref raw_trailers,
+                ref raw_chunks,
+                ref mut raw_line,
+                ref mut deferred,
             } => {
+                if let Some(DeferredError(e)) = deferred.take() {
+                    return Poll::Ready(Err(e));
+                }
                 let h1_max_headers = h1_max_headers.unwrap_or(DEFAULT_MAX_HEADERS);
                 let h1_max_header_size = h1_max_header_size.unwrap_or(TRAILER_LIMIT);
+                let mut data = BytesMut::new();
                 loop {
+                    // The data goes out before a large chunk, read on its own, and before
+                    // the last chunk, so trailers follow it.
+                    if !data.is_empty()
+                        && (data.len() >= CHUNKS_COALESCED
+                            || *state == ChunkedState::EndCr
+                            || *state == ChunkedState::Body
+                                && *chunk_len >= CHUNKS_COALESCED as u64)
+                    {
+                        return Poll::Ready(Ok(Frame::data(data.freeze())));
+                    }
                     let mut buf = None;
-                    // advances the chunked state
-                    *state = ready!(state.step(
-                        cx,
-                        body,
-                        StepArgs {
-                            chunk_size: chunk_len,
-                            extensions_cnt,
-                            chunk_buf: &mut buf,
-                            trailers_buf,
-                            trailers_cnt,
-                            max_headers_cnt: h1_max_headers,
-                            max_headers_bytes: h1_max_header_size,
+                    let args = StepArgs {
+                        chunk_size: chunk_len,
+                        extensions_cnt,
+                        chunk_buf: &mut buf,
+                        trailers_buf,
+                        trailers_cnt,
+                        max_headers_cnt: h1_max_headers,
+                        max_headers_bytes: h1_max_header_size,
+                    };
+                    let prev = *state;
+                    let step = if raw_chunks.is_some() && state.is_size_line() {
+                        let mut rdr = LineRecorder {
+                            rdr: body,
+                            line: raw_line,
+                        };
+                        state.step(cx, &mut rdr, args)
+                    } else {
+                        state.step(cx, body, args)
+                    };
+                    if !data.is_empty() && !matches!(step, Poll::Ready(Ok(_))) {
+                        if let Poll::Ready(Err(e)) = step {
+                            *deferred = Some(DeferredError(e));
                         }
-                    ))?;
+                        return Poll::Ready(Ok(Frame::data(data.freeze())));
+                    }
+                    // advances the chunked state
+                    *state = ready!(step)?;
+                    if prev == ChunkedState::SizeLf {
+                        if let Some(raw) = raw_chunks {
+                            // The line ends at its CR, which the recorder read too.
+                            raw_line.truncate(raw_line.len().saturating_sub(1));
+                            raw.lock().push((*chunk_len, raw_line.split().freeze()));
+                        }
+                    }
                     if *state == ChunkedState::End {
                         trace!("end of chunked");
 
@@ -217,6 +307,7 @@ impl Decoder {
                             match decode_trailers(
                                 &mut trailers_buf.take().expect("Trailer is None"),
                                 *trailers_cnt,
+                                raw_trailers.as_ref(),
                             ) {
                                 Ok(headers) => {
                                     return Poll::Ready(Ok(Frame::trailers(headers)));
@@ -230,7 +321,10 @@ impl Decoder {
                         return Poll::Ready(Ok(Frame::data(Bytes::new())));
                     }
                     if let Some(buf) = buf {
-                        return Poll::Ready(Ok(Frame::data(buf)));
+                        if data.is_empty() && buf.len() >= CHUNKS_COALESCED {
+                            return Poll::Ready(Ok(Frame::data(buf)));
+                        }
+                        data.extend_from_slice(&buf);
                     }
                 }
             }
@@ -304,6 +398,17 @@ macro_rules! put_u8 {
 impl ChunkedState {
     fn new() -> ChunkedState {
         ChunkedState::Start
+    }
+
+    /// Whether this state reads a chunk-size line, up to and including its CR.
+    fn is_size_line(self) -> bool {
+        matches!(
+            self,
+            ChunkedState::Start
+                | ChunkedState::Size
+                | ChunkedState::SizeLws
+                | ChunkedState::Extension
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -434,7 +539,10 @@ impl ChunkedState {
         // them from themselves, we reject extensions containing plain LF as
         // well.
         match byte!(rdr, cx) {
-            b'\r' => Poll::Ready(Ok(ChunkedState::SizeLf)),
+            b'\r' => {
+                *extensions_cnt = 0;
+                Poll::Ready(Ok(ChunkedState::SizeLf))
+            }
             b'\n' => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid chunk extension contains newline",
@@ -637,8 +745,14 @@ impl ChunkedState {
 }
 
 // TODO: disallow Transfer-Encoding, Content-Length, Trailer, etc in trailers ??
-fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Error> {
+fn decode_trailers(
+    buf: &mut BytesMut,
+    count: usize,
+    raw: Option<&(RawTrailers, TrailerSpacing)>,
+) -> Result<HeaderMap, io::Error> {
     let mut trailers = HeaderMap::new();
+    let mut raw_fields = Vec::new();
+    let mut spacings = Vec::new();
     let mut headers = vec![httparse::EMPTY_HEADER; count];
     let res = httparse::parse_headers(buf, &mut headers);
     match res {
@@ -665,9 +779,20 @@ fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Er
                     }
                 };
 
-                trailers.insert(name, value);
+                if raw.is_some() {
+                    raw_fields.push((
+                        Bytes::copy_from_slice(header.name.as_bytes()),
+                        value.clone(),
+                    ));
+                    spacings.push(trailer_spacing(buf, header));
+                }
+                trailers.append(name, value);
             }
 
+            if let Some((raw, spacing)) = raw {
+                raw.0.get_or_init(|| raw_fields);
+                spacing.0.get_or_init(|| spacings);
+            }
             Ok(trailers)
         }
         Ok(httparse::Status::Partial) => Err(io::Error::new(
@@ -675,6 +800,39 @@ fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Er
             "Partial header",
         )),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidInput, e)),
+    }
+}
+
+/// What `header`, parsed from `buf`, has between its name and its value, and after its
+/// value up to its line ending.
+fn trailer_spacing(buf: &[u8], header: &httparse::Header<'_>) -> (Bytes, Bytes) {
+    let base = buf.as_ptr() as usize;
+    let name_end = header.name.as_ptr() as usize - base + header.name.len();
+    let value_start = header.value.as_ptr() as usize - base;
+    let value_end = value_start + header.value.len();
+    let line_end = buf[value_end..]
+        .iter()
+        .position(|&byte| byte == b'\r' || byte == b'\n')
+        .map_or(buf.len(), |at| value_end + at);
+    (
+        Bytes::copy_from_slice(&buf[name_end..value_start]),
+        Bytes::copy_from_slice(&buf[value_end..line_end]),
+    )
+}
+
+/// An error the decoder met after data it returned first.
+#[derive(Debug)]
+struct DeferredError(io::Error);
+
+impl Clone for DeferredError {
+    fn clone(&self) -> Self {
+        DeferredError(io::Error::new(self.0.kind(), self.0.to_string()))
+    }
+}
+
+impl PartialEq for DeferredError {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.kind() == other.0.kind() && self.0.to_string() == other.0.to_string()
     }
 }
 
@@ -920,8 +1078,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_chunked_extensions_over_limit() {
-        // construct a chunked body where each individual chunked extension
-        // is totally fine, but combined is over the limit.
+        // construct a chunked body where each chunk's extensions are fine,
+        // though combined over the limit, then a chunk whose own are over it.
         let per_chunk = super::CHUNKED_EXTENSIONS_LIMIT * 2 / 3;
         let mut scratch = vec![];
         for _ in 0..2 {
@@ -929,6 +1087,9 @@ mod tests {
             scratch.extend(b"x".repeat(per_chunk as usize));
             scratch.extend(b"\r\nA\r\n");
         }
+        scratch.extend(b"1;");
+        scratch.extend(b"x".repeat(super::CHUNKED_EXTENSIONS_LIMIT as usize));
+        scratch.extend(b"\r\nA\r\n");
         scratch.extend(b"0\r\n\r\n");
         let mut mock_buf = Bytes::from(scratch);
 
@@ -939,7 +1100,7 @@ mod tests {
             .expect("decode1")
             .into_data()
             .expect("unknown frame type");
-        assert_eq!(&buf1[..], b"A");
+        assert_eq!(&buf1[..], b"AA");
 
         let err = decoder
             .decode_fut(&mut mock_buf)
@@ -1064,7 +1225,7 @@ mod tests {
         buf.extend_from_slice(
             b"Expires: Wed, 21 Oct 2015 07:28:00 GMT\r\nX-Stream-Error: failed to decode\r\n\r\n",
         );
-        let headers = decode_trailers(&mut buf, 2).expect("decode_trailers");
+        let headers = decode_trailers(&mut buf, 2, None).expect("decode_trailers");
         assert_eq!(headers.len(), 2);
         assert_eq!(
             headers.get("Expires").unwrap(),

@@ -3,6 +3,10 @@ use std::{
     future::Future,
     marker::Unpin,
     pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{ready, Context, Poll},
 };
 
@@ -16,6 +20,7 @@ use crate::{
     body::{self, DecodedLength, Incoming},
     dispatch::{self, TrySendError},
     error::BoxError,
+    ext::OnTaken,
     proto::{self, Dispatched, RequestHead},
     upgrade::OnUpgrade,
     Error, Result,
@@ -27,6 +32,12 @@ pub(crate) struct Dispatcher<D, Bs: Body, I, T> {
     body_tx: SenderGuard,
     body_rx: Pin<Box<Option<Bs>>>,
     is_closing: bool,
+    // The user body's error, returned once what was written before it is flushed.
+    body_error: Option<Error>,
+    // Canceled while its body was still going out, it sends the rest of its body, then closes.
+    finishing: bool,
+    // Set while it has a request body still to send, for its transport to see.
+    sending_body: Option<Arc<AtomicBool>>,
 }
 
 pub(crate) trait Dispatch {
@@ -80,7 +91,15 @@ where
             body_tx: SenderGuard(None),
             body_rx: Box::pin(None),
             is_closing: false,
+            body_error: None,
+            finishing: false,
+            sending_body: None,
         }
+    }
+
+    /// Keeps `sending` set while it has a request body still to send.
+    pub(crate) fn set_sending_body(&mut self, sending: Arc<AtomicBool>) {
+        self.sending_body = Some(sending);
     }
 
     #[inline]
@@ -138,6 +157,8 @@ where
                 self.conn.take_error()?;
                 return Poll::Ready(Ok(Dispatched::Upgrade(pending)));
             } else if should_shutdown {
+                // What it wrote goes out first, a request it closes mid-body included.
+                ready!(self.poll_flush(cx))?;
                 ready!(self.conn.poll_shutdown(cx)).map_err(Error::new_shutdown)?;
             }
             self.conn.take_error()?;
@@ -157,6 +178,10 @@ where
             let _ = self.poll_read(cx)?;
             let write_ready = self.poll_write(cx)?.is_ready();
             let flush_ready = self.poll_flush(cx)?.is_ready();
+            let _ = self
+                .conn
+                .poll_relay_half_close(cx)
+                .map_err(Error::new_shutdown)?;
 
             // If we can write more body and the connection is ready, we should
             // write again. If we return `Ready(Ok(())` here, we will yield
@@ -281,6 +306,15 @@ where
         // can dispatch receive, or does it still care about other incoming message?
         match ready!(self.dispatch.poll_ready(cx)) {
             Ok(()) => (),
+            // Canceled while its body is still going out, it reads nothing more, and sends the
+            // rest of its body, until that ends or fails: a proxy's client ending mid-request sent
+            // it before it ended, and a body paced is still to come.
+            Err(()) if self.body_rx.is_some() && !self.dispatch.should_poll() => {
+                trace!("request canceled mid-body, sending the rest of its body");
+                self.finishing = true;
+                self.conn.close_read();
+                return Poll::Ready(Ok(()));
+            }
             Err(()) => {
                 trace!("dispatch no longer receiving messages");
                 self.close();
@@ -335,7 +369,10 @@ where
 
     fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         loop {
-            if self.is_closing {
+            if self.body_error.is_some() {
+                ready!(self.poll_flush(cx))?;
+                return Poll::Ready(Err(self.body_error.take().expect("a body error")));
+            } else if self.is_closing {
                 return Poll::Ready(Ok(()));
             } else if self.body_rx.is_none()
                 && self.conn.can_write_head()
@@ -378,12 +415,27 @@ where
                         continue;
                     }
 
-                    let item = ready!(body.as_mut().poll_frame(cx));
-                    if let Some(item) = item {
-                        let frame = item.map_err(|e| {
+                    let item = match self.conn.poll_expect_continue(cx) {
+                        Poll::Ready(()) => ready!(body.as_mut().poll_frame(cx)),
+                        // Finishing, a body still held back for its 100 Continue goes unsent.
+                        Poll::Pending if self.finishing => {
                             *clear_body = true;
-                            Error::new_user_body(e)
-                        })?;
+                            self.is_closing = true;
+                            self.conn.close_write();
+                            continue;
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    self.conn.sending_body();
+                    if let Some(item) = item {
+                        let frame = match item {
+                            Ok(frame) => frame,
+                            Err(e) => {
+                                *clear_body = true;
+                                self.body_error = Some(Error::new_user_body(e));
+                                continue;
+                            }
+                        };
 
                         if frame.is_data() {
                             let chunk = frame.into_data().unwrap_or_else(|_| unreachable!());
@@ -394,7 +446,7 @@ where
                                     trace!("discarding empty chunk");
                                     self.conn.end_body()?;
                                 } else {
-                                    self.conn.write_body_and_end(chunk);
+                                    self.conn.write_body_and_end(chunk)?;
                                 }
                             } else {
                                 if chunk.remaining() == 0 {
@@ -407,7 +459,7 @@ where
                             *clear_body = true;
                             self.conn.write_trailers(
                                 frame.into_trailers().unwrap_or_else(|_| unreachable!()),
-                            );
+                            )?;
                         } else {
                             trace!("discarding unknown frame");
                             continue;
@@ -430,6 +482,9 @@ where
 
     #[inline]
     fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if let Some(sending) = &self.sending_body {
+            sending.store(self.body_rx.is_some(), Ordering::Release);
+        }
         self.conn.poll_flush(cx).map_err(|err| {
             debug!("error writing: {}", err);
             Error::new_body_write(err)
@@ -452,6 +507,9 @@ where
     fn is_done(&self) -> bool {
         if self.is_closing {
             return true;
+        }
+        if self.finishing && self.body_rx.is_some() {
+            return false;
         }
 
         let read_done = self.conn.is_read_closed();
@@ -583,7 +641,10 @@ where
                         Poll::Ready(None)
                     }
                     Poll::Pending => {
-                        let (parts, body) = req.into_parts();
+                        let (mut parts, body) = req.into_parts();
+                        if let Some(taken) = parts.extensions.remove::<OnTaken>() {
+                            taken.taken();
+                        }
                         let head = RequestHead {
                             version: parts.version,
                             subject: proto::RequestLine(parts.method, parts.uri),

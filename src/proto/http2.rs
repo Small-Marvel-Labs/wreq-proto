@@ -4,6 +4,7 @@ pub(crate) mod client;
 pub(crate) mod ping;
 
 use std::{
+    collections::HashMap,
     future::Future,
     io::{self, Cursor, IoSlice},
     pin::Pin,
@@ -14,18 +15,23 @@ use std::{
 use bytes::{Buf, Bytes};
 use http::{
     header::{HeaderName, CONNECTION, TE, TRANSFER_ENCODING, UPGRADE},
-    HeaderMap,
+    HeaderMap, HeaderValue,
+};
+pub use http2::client::Control;
+pub use http2::ext::{
+    FollowingFrame, FrameLog, HeadersFrame, HeadersFrameOptions, LoggedFrame, NeverIndexedPseudo,
+    PrefaceFrame, PseudoHeader, ReceivedPreface, RefusePushes, StreamPriority, UnknownFrame,
 };
 pub use http2::frame::{
     Priorities, PrioritiesBuilder, Priority, PseudoId, PseudoOrder, Setting, SettingId,
     SettingsOrder, SettingsOrderBuilder, StreamDependency, StreamId,
 };
-use http2::{Reason, RecvStream, SendStream};
+use http2::{ext::HeaderOrder, Reason, RecvStream, SendStream};
 use http_body::Body;
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use crate::{error::BoxError, Error, Result};
+use crate::{error::BoxError, ext::RawTrailers, Error, Result};
 
 /// Default initial stream window size defined in HTTP2 spec.
 const SPEC_WINDOW_SIZE: u32 = 65_535;
@@ -119,6 +125,8 @@ pin_project! {
         // it survives across `Poll::Pending` returns from `poll_capacity`; if
         // we left the chunk in a local, it would be dropped on every repoll.
         buffered_data: Option<Peeked<S::Data>>,
+        // The trailer field order to send the body's trailers in, once recorded.
+        raw_trailers: Option<RawTrailers>,
     }
 }
 
@@ -127,18 +135,29 @@ where
     S: Body,
 {
     #[inline]
-    fn new(stream: S, body_tx: SendStream<SendBuf<S::Data>>) -> PipeToSendStream<S> {
+    fn new(
+        stream: S,
+        body_tx: SendStream<SendBuf<S::Data>>,
+        raw_trailers: Option<RawTrailers>,
+    ) -> PipeToSendStream<S> {
         PipeToSendStream {
             stream,
             body_tx,
             data_done: false,
             buffered_data: None,
+            raw_trailers,
         }
     }
 
     #[inline]
     fn send_reset(self: Pin<&mut Self>, reason: http2::Reason) {
         self.project().body_tx.send_reset(reason);
+    }
+
+    /// Calls `sent` once nothing its stream queued is still to go (see
+    /// `SendStream::on_sent`).
+    fn on_sent(self: Pin<&mut Self>, sent: impl FnOnce() + Send + 'static) {
+        self.project().body_tx.on_sent(sent);
     }
 }
 
@@ -242,7 +261,10 @@ where
                         // no more DATA, so give any capacity back
                         me.body_tx.reserve_capacity(0);
                         me.body_tx
-                            .send_trailers(frame.into_trailers().unwrap_or_else(|_| unreachable!()))
+                            .send_trailers_with_order(
+                                frame.into_trailers().unwrap_or_else(|_| unreachable!()),
+                                trailer_order(me.raw_trailers.as_ref()),
+                            )
                             .map_err(Error::new_body_write)?;
                         return Poll::Ready(Ok(()));
                     } else {
@@ -277,7 +299,9 @@ impl<B: Buf> SendStreamExt for SendStream<SendBuf<B>> {
     {
         let err = Error::new_user_body(err);
         debug!("send body user stream error: {}", err);
-        self.send_reset(err.h2_reason());
+        // What the body gave before it failed goes out ahead of the reset: a proxy's client
+        // whose connection ended mid-request sent it before it ended.
+        self.send_reset_after_data(err.h2_reason());
         err
     }
 
@@ -450,6 +474,36 @@ where
     }
 }
 
+/// `fields` in `order`, each name as bytes, each listed name taking the next value of
+/// that name.
+pub(crate) fn ordered_fields(
+    fields: &HeaderMap,
+    order: Vec<HeaderName>,
+) -> Vec<(Bytes, HeaderValue)> {
+    let mut values = HashMap::new();
+    order
+        .into_iter()
+        .filter_map(|name| {
+            let value = values
+                .entry(name.clone())
+                .or_insert_with(|| fields.get_all(&name).iter())
+                .next()?
+                .clone();
+            Some((Bytes::copy_from_slice(name.as_ref()), value))
+        })
+        .collect()
+}
+
+/// The field order `raw` recorded, once it has, to send trailers in.
+fn trailer_order(raw: Option<&RawTrailers>) -> HeaderOrder {
+    let fields = raw.and_then(|raw| raw.0.get()).into_iter().flatten();
+    HeaderOrder(
+        fields
+            .filter_map(|(name, _)| HeaderName::from_bytes(name).ok())
+            .collect(),
+    )
+}
+
 fn h2_to_io_error(e: http2::Error) -> std::io::Error {
     if e.is_io() {
         e.into_io()
@@ -539,6 +593,24 @@ pub struct Http2Options {
 
     /// The list of PRIORITY frames to be sent after connection establishment.
     pub priorities: Option<Priorities>,
+
+    /// The exact parameters of the initial SETTINGS frame, in place of the individual
+    /// settings and their order.
+    pub settings_frame: Option<Vec<(u16, u32)>>,
+
+    /// Frames sent once, in order, right ahead of the first request's HEADERS.
+    pub preface_frames: Option<Vec<PrefaceFrame>>,
+
+    /// The released capacity the connection's WINDOW_UPDATEs wait for, in place of half
+    /// the window.
+    pub connection_window_threshold: Option<u32>,
+
+    /// The released capacity the streams' WINDOW_UPDATEs wait for, in place of half the
+    /// window.
+    pub stream_window_threshold: Option<u32>,
+
+    /// How many of the frames it sends a connection records, if it records them.
+    pub record_frames: Option<usize>,
 }
 
 impl Http2OptionsBuilder {
@@ -849,6 +921,58 @@ impl Http2OptionsBuilder {
         self
     }
 
+    /// Sends exactly `params` as the initial SETTINGS frame: each `(identifier, value)`
+    /// in order, unknown identifiers and repeats included, as captured from a client.
+    ///
+    /// The connection then behaves as the frame says: the known parameters it carries
+    /// replace the header table size, push, max concurrent streams, initial window size,
+    /// max frame size, max header list size, extended CONNECT and RFC 7540 priorities
+    /// options, the ones it leaves out keep their protocol defaults, and
+    /// [`settings_order`](Self::settings_order) no longer applies.
+    #[inline]
+    pub fn settings_frame<I>(mut self, params: I) -> Self
+    where
+        I: IntoIterator<Item = (u16, u32)>,
+    {
+        self.opts.settings_frame = Some(params.into_iter().collect());
+        self
+    }
+
+    /// Sends `frames` once, in order, after the SETTINGS frame and right ahead of the
+    /// connection's first request's HEADERS: connection WINDOW_UPDATEs, PRIORITY frames
+    /// and frames of types HTTP/2 doesn't define (see [`PrefaceFrame`]).
+    #[inline]
+    pub fn preface_frames<I>(mut self, frames: I) -> Self
+    where
+        I: IntoIterator<Item = PrefaceFrame>,
+    {
+        self.opts.preface_frames = Some(frames.into_iter().collect());
+        self
+    }
+
+    /// Sends a WINDOW_UPDATE once `connection`, for the connection, or `stream`, for a
+    /// stream, bytes of received data were released since the last, rather than once half
+    /// the window was; `None` keeps half the window.
+    #[inline]
+    pub fn window_update_thresholds(
+        mut self,
+        connection: Option<u32>,
+        stream: Option<u32>,
+    ) -> Self {
+        self.opts.connection_window_threshold = connection;
+        self.opts.stream_window_threshold = stream;
+        self
+    }
+
+    /// Records up to `limit` of the frames each connection sends but DATA, in wire order:
+    /// each response then carries a [`HeadersFrame`] with its request's HEADERS as sent
+    /// and the connection's [`FrameLog`].
+    #[inline]
+    pub fn record_frames(mut self, limit: usize) -> Self {
+        self.opts.record_frames = Some(limit);
+        self
+    }
+
     /// Builds the `Http2Options` instance.
     #[inline]
     pub fn build(self) -> Http2Options {
@@ -898,6 +1022,11 @@ impl Default for Http2Options {
             headers_pseudo_order: None,
             headers_stream_dependency: None,
             priorities: None,
+            settings_frame: None,
+            preface_frames: None,
+            connection_window_threshold: None,
+            stream_window_threshold: None,
+            record_frames: None,
         }
     }
 }

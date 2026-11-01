@@ -21,8 +21,12 @@ use super::{
 };
 use crate::{
     body::DecodedLength,
-    ext::OnInformational,
+    ext::{
+        ExpectContinue, OnInformational, RawChunks, RawTrailers, ReadClosed, RecordResponseChunks,
+        TrailerSpacing,
+    },
     proto::{headers, BodyLength, MessageHead},
+    rt::Sleep,
     upgrade, Error, Result,
 };
 
@@ -58,6 +62,10 @@ where
                 h1_max_headers: None,
                 h09_responses: false,
                 on_informational: None,
+                expect_continue: None,
+                record_response_chunks: false,
+                relay_half_close: None,
+                write_shut_down: false,
                 notify_read: false,
                 reading: Reading::Init,
                 writing: Writing::Init,
@@ -163,7 +171,7 @@ where
         debug_assert!(self.can_read_head());
         trace!("Conn::read_head");
 
-        let msg = match self.io.parse::<T>(
+        let mut msg = match self.io.parse::<T>(
             cx,
             ParseContext {
                 cached_headers: &mut self.state.cached_headers,
@@ -172,6 +180,7 @@ where
                 h1_max_headers: self.state.h1_max_headers,
                 h09_responses: self.state.h09_responses,
                 on_informational: &mut self.state.on_informational,
+                expect_continue: &mut self.state.expect_continue,
             },
         ) {
             Poll::Ready(Ok(msg)) => msg,
@@ -191,6 +200,10 @@ where
 
         // Drop any OnInformational callbacks, we're done there!
         self.state.on_informational = None;
+        if self.state.expect_continue.take().is_some() {
+            debug!("final response before 100 Continue; not sending the request body");
+            self.state.close_write();
+        }
 
         self.state.busy();
         self.state.keep_alive &= msg.keep_alive;
@@ -202,6 +215,21 @@ where
             Wants::EMPTY
         };
 
+        let raw_trailers = (msg.decode == DecodedLength::CHUNKED).then(|| {
+            let raw = RawTrailers::default();
+            let spacing = TrailerSpacing::default();
+            msg.head.extensions.insert(raw.clone());
+            msg.head.extensions.insert(spacing.clone());
+            (raw, spacing)
+        });
+        let raw_chunks = (self.state.record_response_chunks
+            && msg.decode == DecodedLength::CHUNKED)
+            .then(|| {
+                let raw = RawChunks::default();
+                msg.head.extensions.insert(raw.clone());
+                raw
+            });
+
         if msg.decode == DecodedLength::ZERO {
             if msg.expect_continue {
                 debug!("ignoring expect-continue since body is empty");
@@ -211,20 +239,20 @@ where
         } else if msg.expect_continue && msg.head.version.gt(&Version::HTTP_10) {
             // TODO: remove this when we land h1_max_header_size support
             let h1_max_header_size = None;
-            self.state.reading = Reading::Continue(Decoder::new(
-                msg.decode,
-                self.state.h1_max_headers,
-                h1_max_header_size,
-            ));
+            self.state.reading = Reading::Continue(
+                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
+                    .with_raw_trailers(raw_trailers)
+                    .with_raw_chunks(raw_chunks),
+            );
             wants = wants.add(Wants::EXPECT);
         } else {
             // TODO: remove this when we land h1_max_header_size support
             let h1_max_header_size = None;
-            self.state.reading = Reading::Body(Decoder::new(
-                msg.decode,
-                self.state.h1_max_headers,
-                h1_max_header_size,
-            ));
+            self.state.reading = Reading::Body(
+                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
+                    .with_raw_trailers(raw_trailers)
+                    .with_raw_chunks(raw_chunks),
+            );
         }
 
         self.state.allow_trailer_fields = msg
@@ -521,7 +549,25 @@ where
 
         self.state.busy();
 
+        // An HTTP/1.0 request without `Connection: keep-alive` asks the server to close
+        // after its response, whatever version that response says.
+        let http10_close = head.version == Version::HTTP_10
+            && !head
+                .headers
+                .get_all(CONNECTION)
+                .iter()
+                .any(headers::connection_keep_alive);
+        let expects_continue =
+            head.version != Version::HTTP_10 && ExpectContinue::is_expected(&head.headers);
+
         self.enforce_version(&mut head);
+        if http10_close {
+            self.state.disable_keep_alive();
+        }
+
+        let raw_trailers = head.extensions.get::<RawTrailers>().cloned();
+        let trailer_spacing = head.extensions.get::<TrailerSpacing>().cloned();
+        let raw_chunks = head.extensions.get::<RawChunks>().cloned();
         let buf = self.io.headers_buf();
 
         trace_span!("encode_headers");
@@ -539,8 +585,21 @@ where
                 debug_assert!(head.headers.is_empty());
                 self.state.cached_headers = Some(head.headers);
                 self.state.on_informational = head.extensions.remove::<OnInformational>();
+                self.state.record_response_chunks =
+                    head.extensions.remove::<RecordResponseChunks>().is_some();
+                self.state.expect_continue = head
+                    .extensions
+                    .remove::<ExpectContinue>()
+                    .filter(|_| expects_continue && !encoder.is_eof())
+                    .map(|expect| expect.wait.map(|(timer, timeout)| timer.sleep(timeout)));
+                self.state.relay_half_close = head.extensions.remove::<ReadClosed>();
 
-                Some(encoder)
+                Some(
+                    encoder
+                        .with_raw_trailers(raw_trailers)
+                        .with_trailer_spacing(trailer_spacing)
+                        .with_raw_chunks(raw_chunks),
+                )
             }
             Err(err) => {
                 self.state.error = Some(err);
@@ -622,11 +681,49 @@ where
         self.state.writing = state;
     }
 
-    pub(super) fn write_trailers(&mut self, trailers: HeaderMap) {
+    /// Waits until a request body held back for `100 Continue` may be sent: the 100 came,
+    /// or the wait timed out.
+    pub(super) fn poll_expect_continue(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if let Some(Some(wait)) = &mut self.state.expect_continue {
+            ready!(wait.as_mut().poll(cx));
+            debug!("no 100 Continue before the timeout; sending the request body");
+            self.state.expect_continue = None;
+        }
+        Poll::Ready(())
+    }
+
+    /// The request body is going out, so a final response no longer cuts it off.
+    pub(super) fn sending_body(&mut self) {
+        self.state.expect_continue = None;
+    }
+
+    /// Ends the sending side once the request is written, when the client the request
+    /// relays ended its own.
+    pub(super) fn poll_relay_half_close(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(half_closed) = &self.state.relay_half_close else {
+            return Poll::Ready(Ok(()));
+        };
+        if !matches!(self.state.writing, Writing::KeepAlive | Writing::Closed) {
+            return Poll::Ready(Ok(()));
+        }
+        ready!(half_closed.poll_closed(cx));
+        ready!(Pin::new(&mut self.io).poll_flush(cx))?;
+        ready!(self.poll_shutdown(cx))?;
+        trace!("relayed the client's half-close");
+        self.state.relay_half_close = None;
+        self.state.close_write();
+        Poll::Ready(Ok(()))
+    }
+
+    pub(super) fn write_trailers(&mut self, trailers: HeaderMap) -> Result<()> {
         debug_assert!(self.can_write_body() && self.can_buffer_body());
 
         match self.state.writing {
             Writing::Body(ref encoder) => {
+                if let Err(not_eof) = encoder.check_raw_chunks_complete() {
+                    self.state.writing = Writing::Closed;
+                    return Err(Error::new_body_write_aborted().with(not_eof));
+                }
                 if let Some(enc_buf) = encoder.encode_trailers(trailers) {
                     self.io.buffer(enc_buf);
 
@@ -639,12 +736,18 @@ where
             }
             _ => unreachable!("write_trailers invalid state: {:?}", self.state.writing),
         }
+        Ok(())
     }
 
-    pub(super) fn write_body_and_end(&mut self, chunk: B) {
+    pub(super) fn write_body_and_end(&mut self, chunk: B) -> Result<()> {
         debug_assert!(self.can_write_body() && self.can_buffer_body());
         // empty chunks should be discarded at Dispatcher level
         debug_assert!(chunk.remaining() != 0);
+
+        if matches!(&self.state.writing, Writing::Body(encoder) if encoder.has_raw_chunks()) {
+            self.write_body(chunk);
+            return self.end_body();
+        }
 
         let state = match self.state.writing {
             Writing::Body(ref encoder) => {
@@ -659,6 +762,7 @@ where
         };
 
         self.state.writing = state;
+        Ok(())
     }
 
     pub(super) fn end_body(&mut self) -> Result<()> {
@@ -723,9 +827,13 @@ where
     }
 
     pub(super) fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.state.write_shut_down {
+            return Poll::Ready(Ok(()));
+        }
         match ready!(Pin::new(self.io.io_mut()).poll_shutdown(cx)) {
             Ok(()) => {
                 trace!("shut down IO complete");
+                self.state.write_shut_down = true;
                 Poll::Ready(Ok(()))
             }
             Err(e) => {
@@ -812,6 +920,15 @@ struct State {
     /// the current request. MUST be unset after a non-1xx response is
     /// received.
     on_informational: Option<OnInformational>,
+    /// Set until the request body starts, which waits for `100 Continue` until this sleep
+    /// ends.
+    expect_continue: Option<Option<Pin<Box<dyn Sleep>>>>,
+    /// Record the chunk-size lines of the current request's chunked response.
+    record_response_chunks: bool,
+    /// The half-close of the client the request being written relays.
+    relay_half_close: Option<ReadClosed>,
+    /// The sending side is shut down.
+    write_shut_down: bool,
     /// Set to true when the Dispatcher should poll read operations
     /// again. See the `maybe_notify` method for more.
     notify_read: bool,
@@ -978,6 +1095,7 @@ impl State {
 
         self.method = None;
         self.keep_alive.idle();
+        self.relay_half_close = None;
 
         if !self.is_idle() {
             self.close();
